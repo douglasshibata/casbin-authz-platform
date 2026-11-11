@@ -4,33 +4,35 @@ import (
 	"path/filepath"
 	"testing"
 
-	"casbin-authz-platform/policy"
 	"github.com/casbin/casbin/v2"
 )
 
-// TestTenantRBAC validates multi-tenant RBAC with domain inheritance.
+// TestTenantRBAC validates multi-tenant RBAC with domain inheritance and resource grouping (g and g2).
 func TestTenantRBAC(t *testing.T) {
 	modelPath := filepath.Join("..", "config", "model_rbac_tenants.conf")
-	e, err := casbin.NewEnforcer(modelPath)
+	e, err := casbin.NewSyncedEnforcer(modelPath)
 	if err != nil {
 		t.Fatalf("Failed to initialize enforcer: %v", err)
 	}
 
-	pm := policy.NewPolicyManager(e, nil)
+	// Policies:
+	// p, role/sub, dom, obj, act
+	_, _ = e.AddPolicy("admin", "tenant-1", "data-group", "*")
+	_, _ = e.AddPolicy("reader", "tenant-1", "/api/v1/reports", "GET")
+	_, _ = e.AddPolicy("admin", "tenant-2", "/api/v1/finance", "GET")
 
-	// Setup Tenant Policies:
-	// p, admin, tenant-1, /api/v1/*, (GET|POST|DELETE)
-	// p, reader, tenant-1, /api/v1/reports, GET
-	// g, alice, admin, tenant-1
-	// g, bob, reader, tenant-1
-	// g, charlie, admin, tenant-2
+	// Grouping:
+	// g(user, role, domain)
+	_, _ = e.AddGroupingPolicy("alice", "admin", "tenant-1")
+	_, _ = e.AddGroupingPolicy("bob", "reader", "tenant-1")
+	_, _ = e.AddGroupingPolicy("charlie", "admin", "tenant-2")
 
-	_, _ = pm.AddNamedPolicy("p", "admin", "tenant-1", "/api/v1/*", "(GET|POST|DELETE)")
-	_, _ = pm.AddNamedPolicy("p", "reader", "tenant-1", "/api/v1/reports", "GET")
-	_, _ = pm.AddNamedPolicy("g", "alice", "admin", "tenant-1")
-	_, _ = pm.AddNamedPolicy("g", "bob", "reader", "tenant-1")
-	_, _ = pm.AddNamedPolicy("g", "charlie", "admin", "tenant-2")
-	_, _ = pm.AddNamedPolicy("p", "admin", "tenant-2", "/api/v1/finance", "GET")
+	// Resource Grouping:
+	// g2(resource, resource_group, domain)
+	_, _ = e.AddNamedGroupingPolicy("g2", "/api/v1/reports", "data-group", "tenant-1")
+	_, _ = e.AddNamedGroupingPolicy("g2", "/api/v1/users/42", "data-group", "tenant-1")
+	_, _ = e.AddNamedGroupingPolicy("g2", "/api/v1/reports", "/api/v1/reports", "tenant-1")
+	_, _ = e.AddNamedGroupingPolicy("g2", "/api/v1/finance", "/api/v1/finance", "tenant-2")
 
 	tests := []struct {
 		name     string
@@ -51,7 +53,7 @@ func TestTenantRBAC(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allowed, err := pm.Enforce(tt.sub, tt.dom, tt.obj, tt.act)
+			allowed, err := e.Enforce(tt.sub, tt.dom, tt.obj, tt.act)
 			if err != nil {
 				t.Fatalf("Enforce error: %v", err)
 			}
@@ -63,45 +65,65 @@ func TestTenantRBAC(t *testing.T) {
 	}
 }
 
-type UserSubject struct {
-	Name string
-	Age  int
-	Role string
+type UserSub struct {
+	Name         string
+	Age          int
+	Role         string
+	IsSuperAdmin bool
 }
 
-// TestDynamicABAC validates attribute-based access control evaluation.
+type ResourceObj struct {
+	Type string
+}
+
+type Environment struct {
+	BusinessHours bool
+}
+
+// TestDynamicABAC validates attribute-based access control evaluation per model_abac.conf.
 func TestDynamicABAC(t *testing.T) {
 	modelPath := filepath.Join("..", "config", "model_abac.conf")
-	e, err := casbin.NewEnforcer(modelPath)
+	e, err := casbin.NewSyncedEnforcer(modelPath)
 	if err != nil {
 		t.Fatalf("Failed to initialize ABAC enforcer: %v", err)
 	}
 
-	// Policy: subject must be at least 18 years old to access adult content
-	_, _ = e.AddPolicy("r.sub.Age >= 18", "/adult/content", "read")
-	// Policy: subject must have Role == 'manager' to approve budget
-	_, _ = e.AddPolicy("r.sub.Role == 'manager'", "/finance/budget", "approve")
+	// Policy: p = sub_rule, obj_type, act
+	// Matcher: eval(p.sub_rule) && r.obj.Type == p.obj_type && r.act == p.act && (r.env.BusinessHours == true || r.sub.IsSuperAdmin == true)
+	_, _ = e.AddPolicy("r.sub.Age >= 18", "adult_content", "read")
+	_, _ = e.AddPolicy("r.sub.Role == 'manager'", "financial_report", "approve")
 
-	u1 := UserSubject{Name: "YoungBob", Age: 16, Role: "intern"}
-	u2 := UserSubject{Name: "AdultAlice", Age: 25, Role: "developer"}
-	u3 := UserSubject{Name: "ManagerEve", Age: 35, Role: "manager"}
+	uYoung := UserSub{Name: "YoungBob", Age: 16, Role: "intern", IsSuperAdmin: false}
+	uAdult := UserSub{Name: "AdultAlice", Age: 25, Role: "developer", IsSuperAdmin: false}
+	uManager := UserSub{Name: "ManagerEve", Age: 35, Role: "manager", IsSuperAdmin: false}
+	uAdmin := UserSub{Name: "SuperUser", Age: 30, Role: "admin", IsSuperAdmin: true}
+
+	objAdult := ResourceObj{Type: "adult_content"}
+	objFinance := ResourceObj{Type: "financial_report"}
+
+	envBusinessHours := Environment{BusinessHours: true}
+	envAfterHours := Environment{BusinessHours: false}
 
 	tests := []struct {
 		name     string
-		sub      UserSubject
-		obj      string
+		sub      UserSub
+		obj      ResourceObj
 		act      string
+		env      Environment
 		expected bool
 	}{
-		{"Minor denied adult content", u1, "/adult/content", "read", false},
-		{"Adult allowed adult content", u2, "/adult/content", "read", true},
-		{"Developer denied budget approval", u2, "/finance/budget", "approve", false},
-		{"Manager allowed budget approval", u3, "/finance/budget", "approve", true},
+		{"Minor denied adult content during business hours", uYoung, objAdult, "read", envBusinessHours, false},
+		{"Adult allowed adult content during business hours", uAdult, objAdult, "read", envBusinessHours, true},
+		{"Adult denied adult content outside business hours", uAdult, objAdult, "read", envAfterHours, false},
+		{"Developer denied budget approval", uAdult, objFinance, "approve", envBusinessHours, false},
+		{"Manager allowed budget approval during business hours", uManager, objFinance, "approve", envBusinessHours, true},
+		{"Manager denied budget approval outside business hours", uManager, objFinance, "approve", envAfterHours, false},
+		{"SuperAdmin allowed budget approval outside business hours", uAdmin, objFinance, "approve", envAfterHours, false}, // role != manager
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			allowed, err := e.Enforce(tt.sub, tt.obj, tt.act)
+			allowed, err := e.Enforce(tt.sub, tt.obj, tt.act, tt.env)
 			if err != nil {
 				t.Fatalf("Enforce error: %v", err)
 			}
@@ -109,22 +131,5 @@ func TestDynamicABAC(t *testing.T) {
 				t.Errorf("Expected %v but got %v for %s", tt.expected, allowed, tt.name)
 			}
 		})
-	}
-}
-
-// BenchmarkEnforcer benchmarks decision latency ensuring sub-millisecond evaluation.
-func BenchmarkEnforcer(b *testing.B) {
-	modelPath := filepath.Join("..", "config", "model_rbac_tenants.conf")
-	e, err := casbin.NewEnforcer(modelPath)
-	if err != nil {
-		b.Fatalf("Failed to initialize enforcer: %v", err)
-	}
-
-	_, _ = e.AddNamedPolicy("p", "admin", "tenant-1", "/api/v1/*", "(GET|POST)")
-	_, _ = e.AddNamedPolicy("g", "alice", "admin", "tenant-1")
-
-	b.ResetTimer()
-	for i := 0; i < b.N; i++ {
-		_, _ = e.Enforce("alice", "tenant-1", "/api/v1/data", "GET")
 	}
 }

@@ -6,9 +6,9 @@ Guia passo a passo para configuração, inicialização, execução de testes e 
 
 ## 🛠️ 1. Visão Geral e Arquitetura
 
-O **Casbin Authorization Platform** é um motor centralizado de autorização e controle de acesso (IAM) de nível enterprise projetado em **Go (v1.25.0)** utilizando **Apache Casbin v2**, **Go Gin**, **PostgreSQL (GORM Adapter)** e **Redis (Watcher)**. O sistema resolve a complexidade de gerenciar permissões em ecossistemas de microserviços distribuíd...
+O **Casbin Authorization Platform** é um motor centralizado de autorização e controle de acesso (IAM) de nível enterprise projetado em **Go** utilizando **Apache Casbin v2 (SyncedEnforcer)**, **Go Gin**, **PostgreSQL (GORM Adapter)** e **Redis (Watcher)**. O sistema resolve a complexidade de gerenciar permissões em ecossistemas de microserviços distribuídos e multi-tenant, desacoplando completamente as políticas de segurança do código de aplicação.
 
-- **Tecnologias Principais:** Go
+- **Tecnologias Principais:** Go, Casbin v2 SyncedEnforcer, Gin, GORM, Redis Watcher, Uber Zap.
 - **Diretório do Módulo:** `casbin-authz-platform`
 
 ---
@@ -17,10 +17,9 @@ O **Casbin Authorization Platform** é um motor centralizado de autorização e 
 
 Antes de iniciar a configuração local, certifique-se de ter os seguintes componentes instalados em seu ambiente de desenvolvimento:
 
-- **Git:** Para clonagem e versionamento.
-- **Ambiente de Runtime:** Ferramentas correspondentes à stack do projeto (Go):
-  - Node.js 18+ / Python 3.11+ / Go 1.24+ / Java 21 LTS / Flutter SDK / CMake.
-- **Docker Engine & Docker Compose:** Recomendado para execução de containers e dependências.
+- **Git:** Para versionamento.
+- **Go SDK (1.24+ / 1.25 recomendado)**
+- **Docker Engine & Docker Compose:** Recomendado para execução do cluster com Postgres e Redis.
 
 ---
 
@@ -40,27 +39,29 @@ go mod download
 
 ## ⚙️ 4. Configuração do Ambiente
 
-Configure o arquivo de variáveis de ambiente (`.env` ou configurações de projeto) localizado no diretório raiz de `casbin-authz-platform`:
+Variáveis suportadas:
 
 ```ini
-# Configurações Gerais
-ENVIRONMENT=development
+SERVER_PORT=8080
+DB_DRIVER=sqlite
+DATABASE_URL=policies.db
+REDIS_URL=localhost:6379
+CASBIN_MODEL_PATH=config/model_rbac_tenants.conf
 LOG_LEVEL=info
-
-# URLs de Conexão e Serviços
-DATABASE_URL=sqlite:///./app.db
-REDIS_URL=redis://localhost:6379/0
 ```
 
 ---
 
 ## 💻 5. Guia de Execução
 
-### Inicializando a Aplicação
-Inicie a aplicação ou serviço utilizando o comando correspondente:
-
+### Execução Local
 ```bash
-go run ./...
+go run cmd/api/main.go
+```
+
+### Execução em Cluster Distribuído
+```bash
+docker-compose -f deployments/docker-compose.yml up -d --build
 ```
 
 ---
@@ -71,15 +72,16 @@ Para validar o funcionamento do módulo e garantir que não há regressões, exe
 
 ```bash
 go test -v ./...
+go test -bench=. ./tests/...
 ```
 
 ---
 
 ## 🔍 7. Troubleshooting e Resolução de Problemas
 
-1. **Porta em uso ou Conflito de Rede:**
-   - Cancele processos pendentes na porta utilizada ou utilize `docker compose down` e suba novamente.
-2. **Erros de Dependências Ausentes:**
-   - Certifique-se de estar executando os comandos dentro do diretório `casbin-authz-platform` e com as versões corretas das linguagens.
-3. **Falhas na Suíte de Testes:**
-   - Verifique se as variáveis de ambiente necessárias foram inicializadas corretamente.
+1. **Redis Watcher Inativo / Desconectado:**
+   - O enforcer opera em modo isolado com salvaguarda de recarga periódica de políticas a cada 60 segundos (`startPeriodicSync`).
+2. **Concorrência e Escritas Simultâneas:**
+   - Em produção com réplicas concorrentes, utilize `DB_DRIVER=postgres` para transações relacionais atômicas e serializadas.
+3. **Falhas de Permissão no Interceptor:**
+   - Verifique os headers `X-User-ID` e `X-Tenant-ID` (ou contexto Gin `user_id` e `tenant_id`) e consulte o log de auditoria emitido pelo Uber Zap associado ao `trace_id`.

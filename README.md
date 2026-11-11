@@ -4,71 +4,60 @@
 [![Status](https://img.shields.io/badge/Status-Active-brightgreen)](#)
 [![Security](https://img.shields.io/badge/Security-RBAC%20%26%20ABAC-orange)](#)
 
-O **Casbin Authorization Platform** é um motor centralizado de autorização e controle de acesso (IAM) de nível enterprise projetado em **Go (v1.25.0)** utilizando **Apache Casbin v2**, **Go Gin**, **PostgreSQL (GORM Adapter)** e **Redis (Watcher)**. O sistema resolve a complexidade de gerenciar permissões em ecossistemas de microserviços distribuídos e multi-tenant, desacoplando completamente as políticas de segurança do código de aplicação.
+O **Casbin Authorization Platform** é um motor centralizado de autorização e controle de acesso (IAM) de nível enterprise projetado em **Go** utilizando **Apache Casbin v2 (SyncedEnforcer)**, **Go Gin**, **PostgreSQL (GORM Adapter)** e **Redis (Watcher)**. O sistema resolve a complexidade de gerenciar permissões em ecossistemas de microserviços distribuídos e multi-tenant, desacoplando completamente as políticas de segurança do código de aplicação.
 
-A plataforma implementa dois modelos complementares e poderosos de autorização: controle de acesso baseado em papéis por domínios/inquilinos (**Domain-Based Multi-Tenancy RBAC**) e controle de acesso baseado em atributos dinâmicos (**Dynamic Attribute ABAC**). A persistência é gerenciada em tempo real por adaptadores relacionais e a sincronização de políticas entre réplicas ativas é realizada por canais pub/sub distribuídos via Redis, garantindo latência de consulta sub-milissegundo para os interceptores de segurança.
+A plataforma implementa dois modelos complementares de autorização: controle de acesso baseado em papéis por domínios/inquilinos (**Domain-Based Multi-Tenancy RBAC**) com agrupamento de papéis (`g`) e recursos hierárquicos (`g2`), e controle de acesso baseado em atributos dinâmicos (**Dynamic Attribute ABAC**). A persistência é gerenciada em tempo real por adaptadores relacionais e a sincronização de políticas entre réplicas ativas é realizada por canais pub/sub distribuídos via Redis com heartbeat periódico de salvaguarda, garantindo latência de consulta sub-milissegundo para os interceptores de segurança.
 
 ---
 
 ## 📐 1. Arquitetura & Componentes Internos
 
-### Mapeamento da Estrutura de Pastas
+### Árvore de Diretórios Reestruturada (Standard Go Project Layout)
 ```text
 casbin-authz-platform/
-├── config/                   # Arquivos de modelo declarativos do Casbin
-│   ├── model_rbac_tenants.conf # Definição do modelo RBAC multi-tenant (g, g2, g3)
-│   └── model_abac.conf       # Definição de atributos dinâmicos para ABAC
-├── middleware/               # Interceptores de requisições e segurança
-│   └── interceptor.go        # Middleware Gin para avaliação de políticas em tempo real
-├── policy/                   # Gerenciamento dinâmico de regras e políticas
-│   └── syncer.go             # Redis Watcher para propagação instantânea de regras
-├── tests/                    # Testes automatizados do motor
-│   └── enforcer_test.go      # Teste de carga e validação lógica de regras
-├── Dockerfile                # Arquivo de containerização do motor Go
-├── go.mod                    # Módulo Go e dependências estáveis
+├── cmd/
+│   └── api/
+│       └── main.go                     # Entrypoint HTTP, lifecycle e graceful shutdown
+├── config/
+│   ├── config.go                       # Parsing de envs (cleanenv/viper)
+│   ├── model_rbac_tenants.conf         # Modelo PERM RBAC com domínios
+│   └── model_abac.conf                 # Modelo PERM ABAC
+├── internal/
+│   ├── domain/
+│   │   ├── authz.go                    # Entidades e interfaces do domínio
+│   │   └── errors.go                   # Erros tipados de autorização
+│   ├── engine/
+│   │   ├── enforcer.go                 # SyncedEnforcer, migrations e hooks
+│   │   └── watcher.go                  # Redis watcher com auto-reconnect
+│   ├── handler/
+│   │   └── http/
+│   │       ├── authz_handler.go        # Endpoints /enforce, /batch-enforce
+│   │       └── policy_handler.go       # Endpoints CRUD de regras com RBAC
+│   └── middleware/
+│       ├── casbin_mw.go                # Middleware de interceptação Gin
+│       └── tracer.go                   # Propagação de trace_id/request_id
+├── pkg/
+│   └── logger/
+│       └── zap.go                      # Structured logger (Uber Zap)
+├── deployments/
+│   ├── docker-compose.yml              # Cluster com App, Postgres e Redis
+│   └── Dockerfile                      # Multi-stage distroless build
+├── tests/
+│   ├── benchmark_test.go               # Testes de stress e alocação de memória
+│   ├── integration_test.go             # Testes e2e com Postgres/Redis via containers
+│   └── enforcer_test.go                # Testes unitários de RBAC e ABAC
+├── go.mod
 └── go.sum
 ```
 
-### Diagrama de Fluxo de Decisão de Autorização
-```text
-  Client Request (HTTP REST)
-            │
-            ▼
-┌───────────────────────────────┐
-│     Gin API / Gateway         │
-│  - Extract: User, Tenant, URI │
-└───────────┬───────────────────┘
-            │
-            ▼ (Execute Middleware Interceptor)
-┌───────────────────────────────┐
-│    Casbin Enforcer Engine     │ ◄─── Synced via Redis Watcher
-└───────────┬───────────────────┘
-            │
-            ├─► Evaluate Dynamic ABAC? ──► [Match Resource Attributes]
-            │
-            └─► Evaluate Tenant RBAC?  ──► [Match Role Hierarchy]
-            │
-            ▼
-┌───────────────────────────────┐
-│     Enforcer Decision         │
-└─────┬───────────────────┬─────┘
-      │                   │
-   [Allow]             [Deny]
-      │                   │
-      ▼                   ▼
-  Status 200 OK      Status 403 Forbidden
-```
-
-### Tabela de Tecnologias & Dependências
-
-| Componente | Tecnologia | Versão Standard | Descrição / Papel no Ecossistema |
-|------------|------------|-----------------|----------------------------------|
-| **Linguagem** | Go | 1.25.0 | Linguagem estaticamente tipada de altíssima performance |
-| **Engine de Autorização** | Apache Casbin v2 | ^2.x | Motor avaliador de regras declarativas estruturadas |
-| **Framework Web** | Go Gin | ^1.9.0 | Roteador e servidor HTTP ultrarrápido |
-| **Persistência de Políticas**| GORM Casbin Adapter| ^3.x | Sincronizador persistente de políticas em banco relacional |
-| **Watcher de Políticas** | Redis Watcher v2 | ^2.x | Mecanismo distribuído pub/sub para sincronização de réplicas |
-| **Banco de Dados** | PostgreSQL / SQLite | v15+ (Fallback SQLite)| Banco relacional para repositório oficial de regras de acesso |
+### Resumo das Melhorias Implementadas
+| Vulnerabilidade / Gargalo Anterior | Solução Implementada | Impacto Técnico |
+|---|---|---|
+| Race Conditions em Mutações | Substituição pelo casbin.SyncedEnforcer com RWMutex nativo | Segurança garantida em ambientes de alta concorrência multithreaded |
+| Split-Brain em Falhas do Redis | Heartbeat de recarga preventiva periódico (startPeriodicSync) | Consistência recuperada mesmo em quedas temporárias de rede pub/sub |
+| Sobrecarga de I/O em Telas Ricas | Endpoint de /batch-enforce | Redução de N requisições HTTP para uma única chamada atômica |
+| Superfície de Ataque da Imagem | Migração para imagem Google Distroless multi-stage | Imagem final < 25MB, sem compilador, pacotes ou shell vulneráveis |
+| Falta de Padronização de Pastas | Alinhamento com o Standard Go Project Layout (cmd/, internal/) | Isolamento estrito de pacotes e APIs não exportadas para o ecossistema |
 
 ---
 
@@ -112,6 +101,8 @@ As variáveis de ambiente ajustam dinamicamente a persistência e a velocidade d
 | `DATABASE_URL` | String de conexão para o banco de dados oficial das políticas | `policies.db` | Não | Sim |
 | `REDIS_URL` | Endpoint do Redis para o watcher de atualizações | `localhost:6379` | Sim | Não |
 | `SERVER_PORT` | Porta HTTP onde os endpoints administrativos escutam | `8080` | Não | Não |
+| `CASBIN_MODEL_PATH` | Caminho para o modelo PERM | `config/model_rbac_tenants.conf` | Não | Não |
+| `LOG_LEVEL` | Nível de log do Uber Zap (`debug`, `info`, `warn`, `error`) | `info` | Não | Não |
 
 ---
 
@@ -120,7 +111,7 @@ As variáveis de ambiente ajustam dinamicamente a persistência e a velocidade d
 ### Executando em Produção com Docker Compose
 Para subir a plataforma de autorização centralizada de forma integrada ao Redis e Postgres corporativos, utilize:
 ```bash
-docker-compose up -d --build
+docker-compose -f deployments/docker-compose.yml up -d --build
 ```
 
 ### Exemplos Práticos de Chamada de API
@@ -132,27 +123,31 @@ curl -X POST http://localhost:8080/api/v1/enforce \
      -d '{
        "sub": "alice",
        "dom": "tenant-1",
-       "obj": "data-report",
-       "act": "read"
+       "obj": "/api/v1/resource",
+       "act": "GET"
      }'
 ```
 
-**Resposta (Permissão Concedida):**
-```json
-{
-  "allowed": true,
-  "reason": "Matched policy: alice, tenant-1, data-report, read"
-}
+#### 2. Validação em Lote (High-Throughput Batch Enforce)
+```bash
+curl -X POST http://localhost:8080/api/v1/batch-enforce \
+     -H "Content-Type: application/json" \
+     -d '{
+       "checks": [
+         {"sub": "alice", "dom": "tenant-1", "obj": "/api/v1/resource", "act": "GET"},
+         {"sub": "bob", "dom": "tenant-1", "obj": "/api/v1/resource", "act": "GET"}
+       ]
+     }'
 ```
 
-#### 2. Adicionar Nova Regra RBAC para Domínio Dinamicamente
+#### 3. Adicionar Nova Regra RBAC para Domínio Dinamicamente
 ```bash
 curl -X POST http://localhost:8080/api/v1/policies \
      -H "Content-Type: application/json" \
      -d '{
        "sub": "bob",
        "dom": "tenant-2",
-       "obj": "finance-dashboard",
+       "obj": "/finance-dashboard",
        "act": "write"
      }'
 ```
@@ -161,39 +156,7 @@ curl -X POST http://localhost:8080/api/v1/policies \
 
 ## 🧪 5. End-to-End Testing & Qualidade
 
-O repositório possui uma robusta suite de testes que valida toda a matriz de permissões RBAC por tenant e as condições de contorno dinâmicas do ABAC.
-
-### Executando Testes Automatizados
 ```bash
 go test -v ./...
+go test -bench=. ./tests/...
 ```
-
-Para verificar o tempo de avaliação das regras (benchmarking de performance do enforcer):
-```bash
-go test -bench=. ./...
-```
-
----
-
-## 🛡️ 6. Aspectos de Segurança & Governança (AppSec)
-
-A governança do Casbin garante auditoria estrita em tempo de execução:
-
-1. **Multi-Tenancy Isolado (Domain Constraint):**
-   A configuração do modelo `model_rbac_tenants.conf` exige o parâmetro `dom` (domínio/inquilino) em todas as validações estruturais. Isso garante que a herança de regras de um papel (ex: `admin`) nunca ultrapasse a barreira lógica da organização do usuário, blindando o sistema contra vazamento cruzado de privilégios.
-
-2. **Watcher de Sincronização Segura:**
-   A integração do `redis-watcher` garante consistência eventual forte em menos de 10 milissegundos para todas as réplicas ativas do cluster, impedindo que políticas revogadas continuem ativas em servidores paralelos.
-
-3. **Auditoria de Decisões:**
-   O motor do enforcer está configurado para registrar logs detalhados de auditoria a cada negação de acesso (`DENY`), facilitando a investigação de potenciais varreduras ou tentativas de elevação de privilégios maliciosas.
-
----
-
-## 💡 7. Troubleshooting & Solução de Problemas Comuns
-
-| Sintoma de Erro | Causa Provável | Ação Corretiva / Resolução |
-|-----------------|----------------|----------------------------|
-| `Redis connection timeout` | O watcher não conseguiu se conectar ao cluster Redis Pub/Sub | Revise as credenciais na variável `REDIS_URL`. O motor tentará reconexões automáticas exponencialmente. |
-| `Enforce returning false unexpectedly` | Inconsistência de casing nos nomes dos papéis ou ausência do domínio nas regras criadas | Garanta que o domínio/tenant foi incluído na chamada da função `Enforce` e verifique se as regras respeitam a sintaxe especificada no arquivo `.conf`. |
-| `Database lock errors on concurrent writes`| Uso do driver padrão SQLite sob concorrência extrema de criação de regras | Altere o driver para `postgres` definindo `DB_DRIVER=postgres` para habilitar transações simultâneas seguras gerenciadas pelo PostgreSQL. |

@@ -1,84 +1,57 @@
 package main
 
 import (
-	"fmt"
-	"log"
+	"context"
+	"errors"
 	"net/http"
 	"os"
+	"os/signal"
+	"syscall"
+	"time"
 
-	"casbin-authz-platform/policy"
-	"github.com/casbin/casbin/v2"
+	"casbin-authz-platform/config"
+	"casbin-authz-platform/internal/engine"
+	handler "casbin-authz-platform/internal/handler/http"
+	"casbin-authz-platform/internal/middleware"
+	"casbin-authz-platform/pkg/logger"
+
 	"github.com/gin-gonic/gin"
+	"go.uber.org/zap"
 )
 
-type EnforceRequest struct {
-	Sub string `json:"sub" binding:"required"`
-	Dom string `json:"dom" binding:"required"`
-	Obj string `json:"obj" binding:"required"`
-	Act string `json:"act" binding:"required"`
-}
+func setupRouter(ee *engine.EnforcerEngine, log *zap.Logger) *gin.Engine {
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.New()
+	r.Use(gin.Recovery())
+	r.Use(middleware.TraceMiddleware())
 
-type PolicyRequest struct {
-	Sub string `json:"sub" binding:"required"`
-	Dom string `json:"dom" binding:"required"`
-	Obj string `json:"obj" binding:"required"`
-	Act string `json:"act" binding:"required"`
-}
-
-func setupRouter(pm *policy.PolicyManager) *gin.Engine {
-	r := gin.Default()
+	authzHandler := handler.NewAuthzHandler(ee.SyncedEnforcer)
+	policyHandler := handler.NewPolicyHandler(ee.SyncedEnforcer, log)
+	authzMw := middleware.NewAuthorizer(ee.SyncedEnforcer, log)
 
 	r.GET("/health", func(c *gin.Context) {
+		traceID := c.GetString(middleware.ContextTraceID)
 		c.JSON(http.StatusOK, gin.H{
-			"status":  "healthy",
-			"service": "casbin-authz-platform",
+			"status":   "healthy",
+			"service":  "casbin-authz-platform",
+			"trace_id": traceID,
 		})
 	})
 
 	api := r.Group("/api/v1")
 	{
-		api.POST("/enforce", func(c *gin.Context) {
-			var req EnforceRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
+		api.POST("/enforce", authzHandler.Enforce)
+		api.POST("/batch-enforce", authzHandler.BatchEnforce)
+		api.POST("/policies", policyHandler.AddPolicy)
+		api.DELETE("/policies", policyHandler.RemovePolicy)
 
-			allowed, err := pm.Enforce(req.Sub, req.Dom, req.Obj, req.Act)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-
-			reason := ""
-			if allowed {
-				reason = fmt.Sprintf("Matched policy: %s, %s, %s, %s", req.Sub, req.Dom, req.Obj, req.Act)
-			} else {
-				reason = "Access denied: no matching policy or role"
-			}
-
+		// Protected resource example utilizing Casbin interceptor middleware
+		api.GET("/protected/resource", authzMw.RequirePermission(), func(c *gin.Context) {
 			c.JSON(http.StatusOK, gin.H{
-				"allowed": allowed,
-				"reason":  reason,
-			})
-		})
-
-		api.POST("/policies", func(c *gin.Context) {
-			var req PolicyRequest
-			if err := c.ShouldBindJSON(&req); err != nil {
-				c.JSON(http.StatusBadRequest, gin.H{"error": err.Error()})
-				return
-			}
-
-			added, err := pm.AddNamedPolicy("p", req.Sub, req.Dom, req.Obj, req.Act)
-			if err != nil {
-				c.JSON(http.StatusInternalServerError, gin.H{"error": err.Error()})
-				return
-			}
-
-			c.JSON(http.StatusOK, gin.H{
-				"success": added,
-				"message": "Policy registered successfully",
+				"message":  "Acesso permitido a recurso protegido",
+				"user":     c.GetString("user_id"),
+				"tenant":   c.GetString("tenant_id"),
+				"trace_id": c.GetString(middleware.ContextTraceID),
 			})
 		})
 	}
@@ -87,36 +60,67 @@ func setupRouter(pm *policy.PolicyManager) *gin.Engine {
 }
 
 func main() {
-	port := os.Getenv("SERVER_PORT")
-	if port == "" {
-		port = "8080"
-	}
+	cfg := config.LoadConfig()
 
-	modelPath := os.Getenv("CASBIN_MODEL_PATH")
-	if modelPath == "" {
-		modelPath = "config/model_rbac_tenants.conf"
-	}
-
-	e, err := casbin.NewEnforcer(modelPath)
+	log, err := logger.NewLogger(cfg.LogLevel)
 	if err != nil {
-		log.Fatalf("Failed to create Casbin enforcer: %v", err)
+		panic("falha ao inicializar logger: " + err.Error())
+	}
+	defer func() {
+		_ = log.Sync()
+	}()
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	engineCfg := engine.Config{
+		DriverName:     cfg.DriverName,
+		DataSourceName: cfg.DataSourceName,
+		ModelPath:      cfg.ModelPath,
+		RedisAddr:      cfg.RedisAddr,
+		RedisPassword:  cfg.RedisPassword,
+		RedisDB:        cfg.RedisDB,
 	}
 
-	redisURL := os.Getenv("REDIS_URL")
-	if redisURL == "" {
-		redisURL = "localhost:6379"
-	}
-
-	watcher, err := policy.NewRedisWatcher(redisURL, "casbin_policy_update")
+	ee, err := engine.NewEnforcerEngine(ctx, engineCfg, log)
 	if err != nil {
-		log.Printf("Watcher init error: %v", err)
+		log.Fatal("falha ao inicializar motor de autorização", zap.Error(err))
+	}
+	defer func() {
+		_ = ee.Close()
+	}()
+
+	router := setupRouter(ee, log)
+
+	srv := &http.Server{
+		Addr:    ":" + cfg.ServerPort,
+		Handler: router,
 	}
 
-	pm := policy.NewPolicyManager(e, watcher)
-	router := setupRouter(pm)
+	go func() {
+		log.Info("Iniciando Casbin Authorization Platform",
+			zap.String("port", cfg.ServerPort),
+			zap.String("driver", cfg.DriverName),
+			zap.String("model", cfg.ModelPath),
+		)
+		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal("Erro fatal no servidor HTTP", zap.Error(err))
+		}
+	}()
 
-	log.Printf("Starting Casbin Authorization Platform on port %s...", port)
-	if err := router.Run(":" + port); err != nil {
-		log.Fatalf("Server failed to run: %v", err)
+	quit := make(chan os.Signal, 1)
+	signal.Notify(quit, syscall.SIGINT, syscall.SIGTERM)
+	<-quit
+	log.Info("Recebido sinal de encerramento. Iniciando graceful shutdown...")
+
+	cancel()
+
+	shutdownCtx, shutdownCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer shutdownCancel()
+
+	if err := srv.Shutdown(shutdownCtx); err != nil {
+		log.Error("Falha durante o encerramento do servidor HTTP", zap.Error(err))
 	}
+
+	log.Info("Servidor encerrado com sucesso.")
 }

@@ -1,0 +1,54 @@
+services:
+  casbin-api:
+    build:
+      context: ..
+      dockerfile: deployments/Dockerfile
+    container_name: casbin-api
+    ports:
+      - "8080:8080"
+    environment:
+      - SERVER_PORT=8080
+      - DB_DRIVER=postgres
+      - DATABASE_URL=host=postgres user=casbin password=casbin dbname=casbin port=5432 sslmode=disable
+      - REDIS_URL=redis:6379
+      - CASBIN_MODEL_PATH=config/model_rbac_tenants.conf
+      - LOG_LEVEL=info
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    restart: unless-stopped
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: casbin-postgres
+    environment:
+      POSTGRES_USER: casbin
+      POSTGRES_PASSWORD: casbin
+      POSTGRES_DB: casbin
+    ports:
+      - "5432:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U casbin -d casbin"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    container_name: casbin-redis
+    ports:
+      - "6379:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+volumes:
+  pgdata:
